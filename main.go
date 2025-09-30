@@ -96,17 +96,23 @@ func handle(name string, id string, c *client.Client, limit size.ByteSize) {
 		}
 	}()
 
-	line, err := ReadLastLine(logfile.f)
+	lastLine, err := ReadLastLine(logfile.f)
 	if err != nil {
 		slog.Warn("读取最后一行失败，从头开始", "container", name, "error", err)
-		line = ""
+		lastLine = ""
 	}
 
 	var since string
-	if line != "" {
-		parts := strings.Split(line, " ")
+	if lastLine != "" {
+		parts := strings.Split(lastLine, " ")
 		if len(parts) > 0 {
-			since = parts[0]
+			timestamp := parts[0]
+			// 解析时间戳并加上1纳秒，避免重复读取最后一行
+			since, err = addNanosecond(timestamp)
+			if err != nil {
+				slog.Warn("解析时间戳失败，使用原时间戳", "timestamp", timestamp, "error", err)
+				since = timestamp
+			}
 		}
 	}
 
@@ -136,6 +142,18 @@ func handle(name string, id string, c *client.Client, limit size.ByteSize) {
 	}
 
 	slog.Info("容器日志处理完成", "container", name)
+}
+
+// addNanosecond 给 RFC3339Nano 格式的时间戳加上1纳秒
+// 这样可以避免 Docker API 的 Since 参数返回已记录的最后一行日志
+func addNanosecond(timestamp string) (string, error) {
+	t, err := time.Parse(time.RFC3339Nano, timestamp)
+	if err != nil {
+		return "", err
+	}
+	// 加上1纳秒
+	t = t.Add(1 * time.Nanosecond)
+	return t.Format(time.RFC3339Nano), nil
 }
 
 func ReadLastLine(file *os.File) (string, error) {
