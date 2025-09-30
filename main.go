@@ -55,6 +55,13 @@ func main() {
 
 	slog.Info("开始监控容器日志", "containers", names, "log-path", *logPath, "limit", *logLimitSize)
 
+	// 跟踪每个容器的当前 ID 和取消函数，用于检测容器重启
+	type containerInfo struct {
+		id     string
+		cancel context.CancelFunc
+	}
+	var containerInfos sync.Map // map[containerName]*containerInfo
+
 	for {
 		infos, err := c.ContainerList(context.Background(), container.ListOptions{})
 		if err != nil {
@@ -63,26 +70,55 @@ func main() {
 			continue
 		}
 
-		var wait sync.WaitGroup
+		// 构建当前运行的容器映射
+		runningContainers := make(map[string]string) // map[name]id
 		for _, info := range infos {
 			for _, cname := range info.Names {
 				cname = strings.TrimPrefix(cname, "/")
 				if slices.Contains(names, cname) {
-					containerName := cname
-					containerID := info.ID
-					wait.Go(func() {
-						handle(containerName, containerID, c, limit)
-					})
+					runningContainers[cname] = info.ID
 					break
 				}
 			}
 		}
-		wait.Wait()
+
+		// 检查需要监控的每个容器
+		for _, name := range names {
+			newID, isRunning := runningContainers[name]
+
+			if !isRunning {
+				// 容器没有运行，如果有旧的监控，取消它
+				if val, exists := containerInfos.Load(name); exists {
+					info := val.(*containerInfo)
+					slog.Info("容器已停止，取消监控", "container", name, "id", info.id[:12])
+					info.cancel()
+					containerInfos.Delete(name)
+				}
+				continue
+			}
+
+			// 容器正在运行
+			val, exists := containerInfos.Load(name)
+
+			if !exists || val.(*containerInfo).id != newID {
+				if exists {
+					info := val.(*containerInfo)
+					slog.Info("检测到容器重启", "container", name, "old_id", info.id[:12], "new_id", newID[:12])
+					info.cancel() // 取消旧的 goroutine
+				} else {
+					slog.Info("发现新容器，开始监控", "container", name, "id", newID[:12])
+				}
+				ctx, cancel := context.WithCancel(context.Background())
+				containerInfos.Store(name, &containerInfo{id: newID, cancel: cancel})
+				go handleWithContext(ctx, name, newID, c, limit)
+			}
+		}
+
 		time.Sleep(10 * time.Second)
 	}
 }
 
-func handle(name string, id string, c *client.Client, limit size.ByteSize) {
+func handleWithContext(ctx context.Context, name string, id string, c *client.Client, limit size.ByteSize) {
 	slog.Info("开始处理容器日志", "container", name, "id", id[:12])
 
 	logfile, err := NewLogFile(name, limit)
@@ -118,7 +154,7 @@ func handle(name string, id string, c *client.Client, limit size.ByteSize) {
 
 	slog.Debug("获取容器日志", "container", name, "since", since)
 
-	r, err := c.ContainerLogs(context.Background(), id, container.LogsOptions{
+	r, err := c.ContainerLogs(ctx, id, container.LogsOptions{
 		ShowStdout: true,
 		ShowStderr: true,
 		Since:      since,
@@ -137,6 +173,13 @@ func handle(name string, id string, c *client.Client, limit size.ByteSize) {
 	}()
 
 	_, err = stdcopy.StdCopy(logfile, logfile, r)
+
+	// 检查是否是因为 context 取消
+	if ctx.Err() != nil {
+		slog.Info("容器监控被取消", "container", name, "reason", ctx.Err())
+		return
+	}
+
 	if err != nil {
 		slog.Error("复制日志数据失败", "container", name, "error", err)
 	}
