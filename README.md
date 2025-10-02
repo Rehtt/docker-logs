@@ -44,6 +44,7 @@ go build -o docker-logs
 | `-container-names` | 必填 | 要监控的容器名称，多个容器用逗号分隔 |
 | `-log-path` | `/var/log` | 日志文件输出路径 |
 | `-limit` | `50MB` | 单个日志文件大小限制 |
+| `-compression` | `false` | 是否启用日志文件压缩（轮转后的文件会被gzip压缩） |
 
 ### 示例
 
@@ -56,12 +57,16 @@ go build -o docker-logs
 
 # 使用不同的日志路径
 ./docker-logs -container-names=app -log-path=/home/user/logs -limit=200MB
+
+# 启用日志压缩（轮转后的文件会被gzip压缩以节省空间）
+./docker-logs -container-names=nginx -log-path=/var/log -limit=50MB -compression=true
 ```
 
 ## 日志文件结构
 
 程序会在指定的日志路径下为每个容器创建目录，日志文件按以下结构组织：
 
+### 未启用压缩时
 ```
 /var/log/
 ├── nginx/
@@ -76,12 +81,32 @@ go build -o docker-logs
     └── redis.log.1
 ```
 
+### 启用压缩时（-compression=true）
+```
+/var/log/
+├── nginx/
+│   ├── nginx.log          # 当前日志文件（未压缩）
+│   ├── nginx.log.1.gz     # 轮转后的日志文件（gzip压缩）
+│   └── nginx.log.2.gz     # 更早的轮转日志文件（gzip压缩）
+├── mysql/
+│   ├── mysql.log
+│   └── mysql.log.1.gz
+└── redis/
+    ├── redis.log
+    └── redis.log.1.gz
+```
+
 ## 日志轮转机制
 
 - 当日志文件大小超过限制时，会自动进行轮转
 - 轮转后的文件会添加数字后缀（如 `.1`, `.2` 等）
 - 程序会查找已存在的轮转文件，使用下一个可用的数字
 - 轮转过程中会按行分割，确保日志完整性
+- **压缩功能**（可选）：
+  - 启用 `-compression=true` 后，轮转的文件会自动使用 gzip 压缩
+  - 当前活动的日志文件保持未压缩状态，便于实时查看
+  - 压缩可以节省大量磁盘空间（通常可压缩至原大小的 10%-20%）
+  - 压缩文件添加 `.gz` 后缀，可使用 `zcat` 或 `gunzip` 查看
 
 ## 断点续传与去重
 
@@ -233,7 +258,7 @@ Requires=docker.service
 [Service]
 Type=simple
 User=root
-ExecStart=/usr/local/bin/docker-logs -container-names=nginx,mysql -log-path=/var/log -limit=100MB
+ExecStart=/usr/local/bin/docker-logs -container-names=nginx,mysql -log-path=/var/log -limit=100MB -compression=true
 Restart=always
 RestartSec=10
 
@@ -273,6 +298,11 @@ ENTRYPOINT ["./docker-logs"]
 5. **断点续传**: 程序重启时从日志文件最后一行的时间戳继续，不会重复记录
 6. **容器重启**: 容器重启后（容器ID改变），程序会从日志文件的断点继续收集新容器的日志
 7. **资源清理**: 容器停止后，相应的监控 goroutine 会被自动取消和清理
+8. **日志压缩**: 
+   - 启用压缩后，轮转文件会被 gzip 压缩以节省空间
+   - 压缩过程中如果程序崩溃，可能导致压缩文件不完整
+   - 当前活动的日志文件始终保持未压缩状态
+   - 查看压缩日志可使用：`zcat /path/to/logfile.log.1.gz` 或 `gunzip -c /path/to/logfile.log.1.gz`
 
 ## 许可证
 
@@ -291,6 +321,7 @@ MIT License
 - 📊 **改进状态追踪**：使用 `sync.Map` 实现高效的容器状态管理
 - 📝 **完善日志输出**：区分容器首次启动、重启、停止等不同状态
 - ⚡ **性能优化**：独立的 Context 确保容器监控相互独立，互不影响
+- 🗜️ **日志压缩支持**：新增 `-compression` 参数，轮转的日志文件自动 gzip 压缩以节省磁盘空间
 
 ### v1.0.0
 - 初始版本

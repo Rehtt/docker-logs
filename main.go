@@ -20,6 +20,7 @@ var (
 	logPath        = flag.String("log-path", "/var/log", "out log path")
 	logLimitSize   = flag.String("limit", "50MB", "log limit size")
 	containerNames = flag.String("container-names", "", "container names. eg: name1,name2")
+	compression    = flag.Bool("compression", false, "log file compression")
 )
 
 func main() {
@@ -121,7 +122,7 @@ func main() {
 func handleWithContext(ctx context.Context, name string, id string, c *client.Client, limit size.ByteSize) {
 	slog.Info("开始处理容器日志", "container", name, "id", id[:12])
 
-	logfile, err := NewLogFile(name, limit)
+	logfile, err := NewLogFile(name, limit, *compression)
 	if err != nil {
 		slog.Error("创建日志文件失败", "container", name, "error", err)
 		return

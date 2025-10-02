@@ -2,7 +2,9 @@ package main
 
 import (
 	"bytes"
+	"compress/gzip"
 	"fmt"
+	"io"
 	"io/fs"
 	"log/slog"
 	"os"
@@ -19,9 +21,10 @@ type LogFile struct {
 	logfile string
 	f       *os.File
 
-	size      uint64
-	limitSize uint64
-	closed    bool
+	size        uint64
+	limitSize   uint64
+	closed      bool
+	compression bool
 }
 
 func (l *LogFile) Write(p []byte) (n int, err error) {
@@ -124,9 +127,28 @@ func (l *LogFile) newFile() (err error) {
 
 		// 重命名当前文件
 		newName := fmt.Sprintf("%s.%d", l.logfile, maxIndex+1)
-		if err = os.Rename(l.logfile, newName); err != nil {
-			slog.Error("重命名日志文件失败", "from", l.logfile, "to", newName, "error", err)
-			return fmt.Errorf("rename %s to %s error: %v", l.logfile, newName, err)
+		if l.compression {
+			newName = newName + ".gz"
+			f, err := os.OpenFile(newName, os.O_CREATE|os.O_WRONLY, 0o644)
+			if err != nil {
+				slog.Error("创建新日志文件失败", "logfile", newName, "error", err)
+				return fmt.Errorf("create log file %s error: %v", newName, err)
+			}
+			defer f.Close()
+			g := gzip.NewWriter(f)
+			defer g.Close()
+			oldLog, err := os.Open(l.logfile)
+			if err != nil {
+				slog.Error("打开日志文件失败", "logfile", l.logfile, "error", err)
+				return fmt.Errorf("open log file %s error: %v", l.logfile, err)
+			}
+			defer oldLog.Close()
+			io.Copy(g, oldLog)
+		} else {
+			if err = os.Rename(l.logfile, newName); err != nil {
+				slog.Error("重命名日志文件失败", "from", l.logfile, "to", newName, "error", err)
+				return fmt.Errorf("rename %s to %s error: %v", l.logfile, newName, err)
+			}
 		}
 
 		slog.Info("日志文件轮转完成", "from", l.logfile, "to", newName)
@@ -150,7 +172,7 @@ func (l *LogFile) newFile() (err error) {
 	return
 }
 
-func NewLogFile(serviceName string, limitSize size.ByteSize) (*LogFile, error) {
+func NewLogFile(serviceName string, limitSize size.ByteSize, compression bool) (*LogFile, error) {
 	dir := filepath.Join(*logPath, serviceName)
 	err := os.MkdirAll(dir, 0o755)
 	if err != nil {
@@ -160,9 +182,10 @@ func NewLogFile(serviceName string, limitSize size.ByteSize) (*LogFile, error) {
 
 	logfile := filepath.Join(dir, serviceName+".log")
 	l := &LogFile{
-		logfile:   logfile,
-		limitSize: uint64(limitSize),
-		closed:    false,
+		logfile:     logfile,
+		limitSize:   uint64(limitSize),
+		closed:      false,
+		compression: compression,
 	}
 
 	slog.Debug("创建日志文件", "service", serviceName, "logfile", logfile, "limit", limitSize)
