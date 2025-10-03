@@ -60,6 +60,7 @@ func main() {
 	type containerInfo struct {
 		id     string
 		cancel context.CancelFunc
+		wg     *sync.WaitGroup
 	}
 	var containerInfos sync.Map // map[containerName]*containerInfo
 
@@ -93,6 +94,7 @@ func main() {
 					info := val.(*containerInfo)
 					slog.Info("容器已停止，取消监控", "container", name, "id", info.id[:12])
 					info.cancel()
+					info.wg.Wait() // 等待 goroutine 完全退出
 					containerInfos.Delete(name)
 				}
 				continue
@@ -106,12 +108,19 @@ func main() {
 					info := val.(*containerInfo)
 					slog.Info("检测到容器重启", "container", name, "old_id", info.id[:12], "new_id", newID[:12])
 					info.cancel() // 取消旧的 goroutine
+					// 等待旧 goroutine 完全退出，避免资源竞争
+					info.wg.Wait()
 				} else {
 					slog.Info("发现新容器，开始监控", "container", name, "id", newID[:12])
 				}
 				ctx, cancel := context.WithCancel(context.Background())
-				containerInfos.Store(name, &containerInfo{id: newID, cancel: cancel})
-				go handleWithContext(ctx, name, newID, c, limit)
+				wg := &sync.WaitGroup{}
+				wg.Add(1)
+				containerInfos.Store(name, &containerInfo{id: newID, cancel: cancel, wg: wg})
+				go func() {
+					defer wg.Done()
+					handleWithContext(ctx, name, newID, c, limit)
+				}()
 			}
 		}
 
@@ -212,21 +221,50 @@ func ReadLastLine(file *os.File) (string, error) {
 		return "", nil // 空文件
 	}
 
-	// 从文件末尾开始向前读
-	var line []byte
-	buf := make([]byte, 1) // 每次读一个字节
-	for offset := int64(1); offset <= size; offset++ {
-		_, err := file.ReadAt(buf, size-offset)
+	// 使用缓冲区读取，每次读取 4KB
+	const bufSize = 4096
+	// 限制最多读取 1MB，避免单行过大导致内存问题
+	const maxReadSize = 1024 * 1024
+
+	var result []byte
+	var totalRead int64
+
+	for offset := size; offset > 0 && totalRead < maxReadSize; {
+		// 计算本次读取的大小
+		readSize := int64(bufSize)
+		if offset < readSize {
+			readSize = offset
+		}
+
+		buf := make([]byte, readSize)
+		readPos := offset - readSize
+
+		_, err := file.ReadAt(buf, readPos)
 		if err != nil {
 			return "", err
 		}
 
-		if buf[0] == '\n' && offset != 1 {
-			// 遇到换行，说明一行结束（忽略最后一个换行符本身）
-			break
+		// 在缓冲区中从后向前查找换行符
+		for i := len(buf) - 1; i >= 0; i-- {
+			// 如果是第一次读取且在文件末尾，跳过文件末尾的换行符
+			// 注意：只跳过文件最后一个字符，如果有多个连续换行符，会返回最后一个非空行
+			if offset == size && readPos+int64(i) == size-1 && buf[i] == '\n' {
+				continue
+			}
+
+			if buf[i] == '\n' {
+				// 找到换行符，返回之后的内容
+				result = append(buf[i+1:], result...)
+				return string(result), nil
+			}
 		}
-		line = append([]byte{buf[0]}, line...)
+
+		// 没找到换行符，将整个缓冲区添加到结果前面
+		result = append(buf, result...)
+		offset -= readSize
+		totalRead += readSize
 	}
 
-	return string(line), nil
+	// 整个文件（或前1MB）都是一行
+	return string(result), nil
 }
