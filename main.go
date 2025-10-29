@@ -8,6 +8,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/Rehtt/Kit/util/size"
@@ -61,6 +62,7 @@ func main() {
 		id     string
 		cancel context.CancelFunc
 		wg     *sync.WaitGroup
+		run    atomic.Bool
 	}
 	var containerInfos sync.Map // map[containerName]*containerInfo
 
@@ -103,10 +105,12 @@ func main() {
 			// 容器正在运行
 			val, exists := containerInfos.Load(name)
 
-			if !exists || val.(*containerInfo).id != newID {
+			if !exists || val.(*containerInfo).id != newID || !val.(*containerInfo).run.Load() {
 				if exists {
 					info := val.(*containerInfo)
-					slog.Info("检测到容器重启", "container", name, "old_id", info.id[:12], "new_id", newID[:12])
+					if info.id != newID {
+						slog.Info("检测到容器重启", "container", name, "old_id", info.id[:12], "new_id", newID[:12])
+					}
 					info.cancel() // 取消旧的 goroutine
 					// 等待旧 goroutine 完全退出，避免资源竞争
 					info.wg.Wait()
@@ -114,13 +118,19 @@ func main() {
 					slog.Info("发现新容器，开始监控", "container", name, "id", newID[:12])
 				}
 				ctx, cancel := context.WithCancel(context.Background())
-				wg := &sync.WaitGroup{}
-				wg.Add(1)
-				containerInfos.Store(name, &containerInfo{id: newID, cancel: cancel, wg: wg})
-				go func() {
-					defer wg.Done()
+
+				info := &containerInfo{id: newID, cancel: cancel, wg: &sync.WaitGroup{}}
+				containerInfos.Store(name, info)
+				info.wg.Add(1)
+				info.run.Store(true)
+				go func(info *containerInfo) {
+					defer func() {
+						info.wg.Done()
+						info.run.Store(false)
+					}()
+
 					handleWithContext(ctx, name, newID, c, limit)
-				}()
+				}(info)
 			}
 		}
 
