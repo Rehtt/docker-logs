@@ -2,7 +2,7 @@ package main
 
 import (
 	"context"
-	"flag"
+	"fmt"
 	"log/slog"
 	"os"
 	"slices"
@@ -11,6 +11,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/Rehtt/Kit/cli"
 	"github.com/Rehtt/Kit/util/size"
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/client"
@@ -18,25 +19,106 @@ import (
 )
 
 var (
-	logPath        = flag.String("log-path", "/var/log", "out log path")
-	logLimitSize   = flag.String("limit", "50MB", "log limit size")
-	containerNames = flag.String("container-names", "", "container names. eg: name1,name2")
-	compression    = flag.Bool("compression", false, "log file compression")
+	logPath        string
+	logLimitSize   string
+	containerNames string
+	compression    bool
 )
 
 func main() {
-	flag.Parse()
-
 	// 初始化日志记录器
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
 		Level: slog.LevelInfo,
 	}))
 	slog.SetDefault(logger)
 
-	limit, err := size.ParseFromString(*logLimitSize)
+	app := cli.NewCLI("", "")
+	app.StringVarShortLong(&logPath, "o", "log-path", "/var/log", "out log path")
+	app.StringVarShortLong(&logLimitSize, "l", "limit", "50MB", "log limit size")
+	app.StringVarShortLong(&containerNames, "n", "container-names", "", "container names. eg: name1,name2")
+	app.BoolVarShortLong(&compression, "c", "compression", false, "log file compression")
+
+	app.CommandFunc = func(args []string) error {
+		return run()
+	}
+
+	app.Run(os.Args[1:])
+}
+
+func handleWithContext(ctx context.Context, name string, id string, c *client.Client, limit size.ByteSize) {
+	slog.Info("开始处理容器日志", "container", name, "id", id[:12])
+
+	logfile, err := NewLogFile(name, limit, compression)
 	if err != nil {
-		slog.Error("解析日志限制大小失败", "error", err, "limit", *logLimitSize)
-		os.Exit(1)
+		slog.Error("创建日志文件失败", "container", name, "error", err)
+		return
+	}
+	defer func() {
+		if err := logfile.Close(); err != nil {
+			slog.Error("关闭日志文件失败", "container", name, "error", err)
+		}
+	}()
+
+	lastLine, err := ReadLastLine(logfile.f)
+	if err != nil {
+		slog.Warn("读取最后一行失败，从头开始", "container", name, "error", err)
+		lastLine = ""
+	}
+
+	var since string
+	if lastLine != "" {
+		parts := strings.Split(lastLine, " ")
+		if len(parts) > 0 {
+			timestamp := parts[0]
+			// 解析时间戳并加上1纳秒，避免重复读取最后一行
+			since, err = addNanosecond(timestamp)
+			if err != nil {
+				slog.Warn("解析时间戳失败，使用原时间戳", "timestamp", timestamp, "error", err)
+				since = timestamp
+			}
+		}
+	}
+
+	slog.Debug("获取容器日志", "container", name, "since", since)
+
+	r, err := c.ContainerLogs(ctx, id, container.LogsOptions{
+		ShowStdout: true,
+		ShowStderr: true,
+		Since:      since,
+		Timestamps: true,
+		Follow:     true,
+		Details:    false,
+	})
+	if err != nil {
+		slog.Error("获取容器日志失败", "container", name, "error", err)
+		return
+	}
+	defer func() {
+		if err := r.Close(); err != nil {
+			slog.Error("关闭日志流失败", "container", name, "error", err)
+		}
+	}()
+
+	_, err = stdcopy.StdCopy(logfile, logfile, r)
+
+	// 检查是否是因为 context 取消
+	if ctx.Err() != nil {
+		slog.Info("容器监控被取消", "container", name, "reason", ctx.Err())
+		return
+	}
+
+	if err != nil {
+		slog.Error("复制日志数据失败", "container", name, "error", err)
+	}
+
+	slog.Info("容器日志处理完成", "container", name)
+}
+
+func run() error {
+	limit, err := size.ParseFromString(logLimitSize)
+	if err != nil {
+		slog.Error("解析日志限制大小失败", "error", err, "limit", logLimitSize)
+		return fmt.Errorf("parse limit size %s error: %v", logLimitSize, err)
 	}
 
 	c, err := client.NewClientWithOpts(
@@ -45,17 +127,17 @@ func main() {
 	)
 	if err != nil {
 		slog.Error("创建 Docker 客户端失败", "error", err)
-		os.Exit(1)
+		return fmt.Errorf("create docker client error: %v", err)
 	}
 	defer c.Close()
 
-	names := strings.Split(*containerNames, ",")
+	names := strings.Split(containerNames, ",")
 	if len(names) == 0 || (len(names) == 1 && names[0] == "") {
-		slog.Error("未指定容器名称", "container-names", *containerNames)
-		os.Exit(1)
+		slog.Error("未指定容器名称", "container-names", containerNames)
+		return fmt.Errorf("no container names specified: %s", containerNames)
 	}
 
-	slog.Info("开始监控容器日志", "containers", names, "log-path", *logPath, "limit", *logLimitSize)
+	slog.Info("开始监控容器日志", "containers", names, "log-path", logPath, "limit", logLimitSize)
 
 	// 跟踪每个容器的当前 ID 和取消函数，用于检测容器重启
 	type containerInfo struct {
@@ -136,75 +218,6 @@ func main() {
 
 		time.Sleep(10 * time.Second)
 	}
-}
-
-func handleWithContext(ctx context.Context, name string, id string, c *client.Client, limit size.ByteSize) {
-	slog.Info("开始处理容器日志", "container", name, "id", id[:12])
-
-	logfile, err := NewLogFile(name, limit, *compression)
-	if err != nil {
-		slog.Error("创建日志文件失败", "container", name, "error", err)
-		return
-	}
-	defer func() {
-		if err := logfile.Close(); err != nil {
-			slog.Error("关闭日志文件失败", "container", name, "error", err)
-		}
-	}()
-
-	lastLine, err := ReadLastLine(logfile.f)
-	if err != nil {
-		slog.Warn("读取最后一行失败，从头开始", "container", name, "error", err)
-		lastLine = ""
-	}
-
-	var since string
-	if lastLine != "" {
-		parts := strings.Split(lastLine, " ")
-		if len(parts) > 0 {
-			timestamp := parts[0]
-			// 解析时间戳并加上1纳秒，避免重复读取最后一行
-			since, err = addNanosecond(timestamp)
-			if err != nil {
-				slog.Warn("解析时间戳失败，使用原时间戳", "timestamp", timestamp, "error", err)
-				since = timestamp
-			}
-		}
-	}
-
-	slog.Debug("获取容器日志", "container", name, "since", since)
-
-	r, err := c.ContainerLogs(ctx, id, container.LogsOptions{
-		ShowStdout: true,
-		ShowStderr: true,
-		Since:      since,
-		Timestamps: true,
-		Follow:     true,
-		Details:    false,
-	})
-	if err != nil {
-		slog.Error("获取容器日志失败", "container", name, "error", err)
-		return
-	}
-	defer func() {
-		if err := r.Close(); err != nil {
-			slog.Error("关闭日志流失败", "container", name, "error", err)
-		}
-	}()
-
-	_, err = stdcopy.StdCopy(logfile, logfile, r)
-
-	// 检查是否是因为 context 取消
-	if ctx.Err() != nil {
-		slog.Info("容器监控被取消", "container", name, "reason", ctx.Err())
-		return
-	}
-
-	if err != nil {
-		slog.Error("复制日志数据失败", "container", name, "error", err)
-	}
-
-	slog.Info("容器日志处理完成", "container", name)
 }
 
 // addNanosecond 给 RFC3339Nano 格式的时间戳加上1纳秒

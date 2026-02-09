@@ -3,7 +3,7 @@ module github.com/Rehtt/docker-logs
 go 1.25.1
 
 require (
-	github.com/Rehtt/Kit v0.1.10-0.20250908021111-97891ee63373
+	github.com/Rehtt/Kit v0.1.14-0.20251030071026-76fa4a20bed4
 	github.com/docker/docker v28.4.0+incompatible
 	github.com/gogf/gf/v2 v2.9.3
 )

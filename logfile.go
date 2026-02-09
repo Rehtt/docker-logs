@@ -206,7 +206,7 @@ func (l *LogFile) newFile() (err error) {
 }
 
 func NewLogFile(serviceName string, limitSize size.ByteSize, compression bool) (*LogFile, error) {
-	dir := filepath.Join(*logPath, serviceName)
+	dir := filepath.Join(logPath, serviceName)
 	err := os.MkdirAll(dir, 0o755)
 	if err != nil {
 		slog.Error("创建日志目录失败", "dir", dir, "error", err)
